@@ -171,7 +171,8 @@ static float measNoiseBaro = 6.25; //0.7f*0.7f;
 // quality gates, currently only tof-Gate is used
 // when tof measurement is not compliant to outlier detection
 // flow-measurements are also not processed.
-static float qualGateTof = 100.0f; // for CF 2.1
+// static float qualGateTof = 100.0f; // for CF 2.1
+static float qualGateTof = 1000.63f; // for CF 2.1 without LPS but only flowdeck, a larger gate is required
 //static float qualGateTof  = 1000.63f; // for CF 2.0 a much larger gate is required but not tuned yet!
 
 static float qualGateFlow = 1000.63f;
