@@ -49,7 +49,7 @@
 #define IMG_W 320
 #define IMG_H 240
 #define MARGIN 5
-#define N_TARGETS 4
+#define N_TARGETS 10
 
 // Custom data types
 
@@ -85,19 +85,21 @@ typedef struct {
 // Global variables
 static State state = GROUND;
 static float landing_height = 0.15f;
+// positive yaw -> turn left
 Pose target_points[N_TARGETS] = { // x y z yaw
                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
                                  {0.5, 0.0, HOVERING_HEIGHT, 0},
-                                 {0.5, 0.0, HOVERING_HEIGHT, 90}
+                                 {0.5, 0.0, HOVERING_HEIGHT, 90},
                                  {0.5, 0.5, HOVERING_HEIGHT, 90},
-                                 //{0.4, 0.4, HOVERING_HEIGHT, 180},
-                                 //{0.2, 0.4, HOVERING_HEIGHT, 180},
-                                 //{0.0, 0.4, HOVERING_HEIGHT, 270},
-                                 //{0.0, 0.2, HOVERING_HEIGHT, 270},
-                                 //{0.0, 0.0, HOVERING_HEIGHT, 0},
-                                 //{0.0, 0.0, HOVERING_HEIGHT, 0} 
+                                 {0.5, 0.5, HOVERING_HEIGHT, 180},
+                                 {0.0, 0.5, HOVERING_HEIGHT, 180},
+                                 {0.0, 0.5, HOVERING_HEIGHT, 270},
+                                 {0.0, 0.0, HOVERING_HEIGHT, 270},
+                                 {0.0, 0.0, HOVERING_HEIGHT, 360},
+                                 {0.0, 0.0, HOVERING_HEIGHT, 0} 
                                 };
 int curr_target = 0;
+int target_counter = 0;
 
 
 // Functions declaration
@@ -309,7 +311,8 @@ bool targetReached(const Pose pose, const Pose target)
 {
   if ( (float)sqrt( pow(pose.x - target.x, 2) +
                     pow(pose.y - target.y, 2) +
-                    pow(pose.z - target.z, 2) ) <= THRESH)
+                    pow(pose.z - target.z, 2) ) <= THRESH
+        && ++target_counter >= 10)
     return true;
   else
     return false;
@@ -371,6 +374,7 @@ void explorationTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, 
   // Get target
   Pose target = target_points[curr_target];
   if (targetReached(pose, target)) {
+    target_counter = 0;
     txPacket->task_info = (float) 1;
     if (curr_target < N_TARGETS-1)
       target = target_points[++curr_target];
