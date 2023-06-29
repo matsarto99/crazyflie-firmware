@@ -86,18 +86,36 @@ typedef struct {
 static State state = GROUND;
 static float landing_height = 0.15f;
 // positive yaw -> turn left
+
+// SQUARE
+// Pose target_points[N_TARGETS] = { // x y z yaw
+//                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
+//                                  {0.5, 0.0, HOVERING_HEIGHT, 0},
+//                                  {0.5, 0.0, HOVERING_HEIGHT, 90},
+//                                  {0.5, 0.5, HOVERING_HEIGHT, 90},
+//                                  {0.5, 0.5, HOVERING_HEIGHT, 180},
+//                                  {0.0, 0.5, HOVERING_HEIGHT, 180},
+//                                  {0.0, 0.5, HOVERING_HEIGHT, 270},
+//                                  {0.0, 0.0, HOVERING_HEIGHT, 270},
+//                                  {0.0, 0.0, HOVERING_HEIGHT, 360},
+//                                  {0.0, 0.0, HOVERING_HEIGHT, 0} 
+//                                 };
+
+// LEFT, RIGHT, FORTH, LEFT, RIGHT, BACK
 Pose target_points[N_TARGETS] = { // x y z yaw
                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
+                                 {0.0, 1.0, HOVERING_HEIGHT, 0},
+                                 {0.0, -1.0, HOVERING_HEIGHT, 0},
+                                 {0.0, 0.0, HOVERING_HEIGHT, 0},
                                  {0.5, 0.0, HOVERING_HEIGHT, 0},
-                                 {0.5, 0.0, HOVERING_HEIGHT, 90},
-                                 {0.5, 0.5, HOVERING_HEIGHT, 90},
-                                 {0.5, 0.5, HOVERING_HEIGHT, 180},
-                                 {0.0, 0.5, HOVERING_HEIGHT, 180},
-                                 {0.0, 0.5, HOVERING_HEIGHT, 270},
-                                 {0.0, 0.0, HOVERING_HEIGHT, 270},
-                                 {0.0, 0.0, HOVERING_HEIGHT, 360},
-                                 {0.0, 0.0, HOVERING_HEIGHT, 0} 
+                                 {1.0, 0.0, HOVERING_HEIGHT, 0},
+                                 {2.0, 0.0, HOVERING_HEIGHT, 0},
+                                 {2.0, 1.0, HOVERING_HEIGHT, 0},
+                                 {2.0, -1.0, HOVERING_HEIGHT, 0},
+                                 {2.0, 0.0, HOVERING_HEIGHT, 0},
+                                 {0.0, 0.0, HOVERING_HEIGHT, 0}
                                 };
+
 int curr_target = 0;
 int target_counter = 0;
 
@@ -129,6 +147,7 @@ void appMain()
   logVarId_t idYawEstimate = logGetVarId("stateEstimate", "yaw");
 
   Pose poseEst;
+  Pose hoveringPose = {0.0,0.0,HOVERING_HEIGHT,0.0};
 
   // Getting the Logging ID to see if system is tumbling or has crashed
   logVarId_t idTumble = logGetVarId("sys", "isTumbled");  // Nonzero if the system thinks it is tumbled/crashed.
@@ -171,7 +190,8 @@ void appMain()
             txPacket.state_info = (float) 1;              //   -> Send 1: Going toward hovering
             state = HOVERING;
             // Lift off
-            setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
         }
@@ -193,7 +213,8 @@ void appMain()
           else if (rxPacket.info == (float) 1) {          // Info 1: Hover
             txPacket.state_info = (float) 1;              //   -> Send 1: Hovering
             // To hovering position
-            setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
           }
           else if (rxPacket.info == (float) 2) {            // Info 2: Start the task
             if (!reachedTargetHeight(poseEst.z, HOVERING_HEIGHT)) {
@@ -202,7 +223,8 @@ void appMain()
               txPacket.state_info = (float) 2;              //   -> Send 2: Drone ready
               state = READY;
             // Still hover, start moving when in state ready
-            setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
             }
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
@@ -217,7 +239,9 @@ void appMain()
             txPacket.state_info = (float) 1;              //   -> Send 1: Go to hovering
             state = HOVERING;
             // Hovering at default height
-            setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            hoveringPose = poseEst
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
           }
           else if (rxPacket.info == (float) 2) {          // Info 2: Start/continue the task
             txPacket.state_info = (float) 2;              //   -> Send 2: Running the task
