@@ -64,9 +64,15 @@ typedef struct __attribute__((packed)) {
 } PacketRX;
 
 typedef struct __attribute__((packed)) {
-  char state_info;
-  char task_info;
-} PacketTX;
+  char message_type;
+  char info;
+} infoPacketTX;
+
+typedef struct __attribute__((packed)) {
+  char message_type;
+  float time_target_reached;
+  float time_planner_avg;
+} dataPacketTX;
 
 typedef enum {
   GROUND,
@@ -86,7 +92,9 @@ typedef struct {
 // Global variables
 static State state = GROUND;
 static float landing_height = 0.15f;
+
 // positive yaw -> turn left
+// positive yaw rate -> turn right
 
 // SQUARE
 // Pose target_points[N_WAYPOINTS] = { // x y z yaw
@@ -122,15 +130,18 @@ int target_counter = 0;
 clock_t t_target_begin;
 double t_target;
 
+PacketRX rxPacket;
+
 
 // Functions declaration
+State readIncomingPacket();
 static void setHoverSetpoint(setpoint_t *setpoint, float vx, float vy, float z, float yawrate);
 static void setPositionSetpoint(setpoint_t *setpoint, float x, float y, float z, float yaw);
 bool reachedTargetHeight(const float est_height, const float target);
 bool targetReached(const Pose pose, const Pose target);
 float collisionProbability(PacketRX *rxPacket);
 float velRepulsive(PacketRX *rxPacket);
-void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket);
+void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, infoPacketTX *txPacket);
 
 
 // Main
@@ -139,10 +150,15 @@ void appMain()
   DEBUG_PRINT("Waiting for activation ...\n");
 
   // Initialize packets for communication
-  PacketRX rxPacket;
-  PacketTX txPacket;
+  infoPacketTX stateTxPacket;
+  stateTxPacket.message_type = 's';
+  infoPacketTX taskTxPacket;
+  taskTxPacket.message_type = 't';
+  dataPacketTX dataTxPacket;
+  dataTxPacket.message_type = 'd';
 
   static setpoint_t setpoint;
+  State received_command = NULL;
 
   // Getting the Logging IDs of the state estimates
   logVarId_t idXEstimate = logGetVarId("stateEstimate", "x");
@@ -180,8 +196,15 @@ void appMain()
 
     // Check connection
     if (logGetInt(idConnected) == 0 && state != GROUND){
-      state = STOPPING;
-      rxPacket.info = (float) 0;
+      state = GROUND;
+      received_command == GROUND;
+      stateTxPacket.info = (float) 0;
+      appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
+    }
+
+    // Read incoming packet from external HW
+    if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
+      received_command = readIncomingPacket();
     }
 
     // State machine
@@ -189,110 +212,85 @@ void appMain()
     {
       // If the drone is on the ground and receives start signal from the pc -> liftoff
       case GROUND: 
-        // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
-          if (rxPacket.info == (float) 0) {               // Info 0: Do nothing
-            txPacket.state_info = (float) 0;              //   -> Send 0: On the ground
-            // Stay on the ground
-            memset(&setpoint, 0, sizeof(setpoint_t));
-          }
-          else if (rxPacket.info == (float) 1) {          // Info 1: Start drone
-            txPacket.state_info = (float) 1;              //   -> Send 1: Going toward hovering
-            state = HOVERING;
-            // Lift off
-            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
-          }
-          appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
-        }
-        else {
-          txPacket.state_info = (float) 0;    // If nothing is received -> Info 0: Do nothing
+        // Stay on the ground
+        //memset(&setpoint, 0, sizeof(setpoint_t));
+        setPositionSetpoint(&setpoint, poseEst.x, poseEst.y, 0, poseEst.yaw);
+        // Check new command
+        if (received_command == HOVERING) {     // Start drone
+          state = HOVERING;
+          stateTxPacket.info = (float) 1;       // -> Send 1: Going toward hovering
+          // appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
+          appchannelSendDataPacket(&stateTxPacket, sizeof(stateTxPacket));
         }
         break;
 
       // If the drone is hovering and receives start signal -> ready to start the task
       case HOVERING: 
-        // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
-          if (rxPacket.info == (float) 0) {               // Info 0: Stop the drone
-            txPacket.state_info = (float) 3;              //   -> Send 3: Start landing
-            state = STOPPING;
-            // Land
-            memset(&setpoint, 0, sizeof(setpoint_t));
+        // To hovering position
+        setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
+        // Check new command
+        if (received_command == GROUND || received_command == STOPPING) {  // Stop the drone
+          state = STOPPING;
+          stateTxPacket.info = (float) 3;     // -> Send 3: Start landing
+          // Go to landing height at current xy position
+          hoveringPose = poseEst;
+          appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
+        }
+        else if (received_command == READY) {     // Start the task
+          if (reachedTargetHeight(poseEst.z, HOVERING_HEIGHT)) {
+            state = READY;
+            stateTxPacket.info = (float) 2;       // -> Send 2: Drone ready
+            appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
+            // Start counter and statistics
+            plan_cycle = 0;
+            t_target_begin = clock();
           }
-          else if (rxPacket.info == (float) 1) {          // Info 1: Hover
-            txPacket.state_info = (float) 1;              //   -> Send 1: Hovering
-            // To hovering position
-            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
-          }
-          else if (rxPacket.info == (float) 2) {            // Info 2: Start the task
-            if (!reachedTargetHeight(poseEst.z, HOVERING_HEIGHT)) {
-              txPacket.state_info = (float) 1;              //   -> Send 1: To hovering position
-            } else {
-              txPacket.state_info = (float) 2;              //   -> Send 2: Drone ready
-              state = READY;
-              plan_cycle = 0;
-              t_target_begin = clock();
-            // Still hover, start moving when in state ready
-            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
-            }
-          }
-          appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
         }
         break;
 
       // If the drone is ready, go on with the task or see if stopping is needed
       case READY: 
-        // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
-          if (rxPacket.info == (float) 1) {               // Info 1: Stop and hover
-            txPacket.state_info = (float) 1;              //   -> Send 1: Go to hovering
-            state = HOVERING;
-            // Hovering at default height in the current position
-            // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            hoveringPose = poseEst;
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
-          }
-          else if (rxPacket.info == (float) 2) {          // Info 2: Start/continue the task
-            txPacket.state_info = (float) 2;              //   -> Send 2: Running the task
-            txPacket.task_info = (float) 0;               //   -> Task info 0: Running the task
-            // Running the task
-            clock_t t_plan_begin = clock();
-            planningTask(poseEst, &setpoint, &rxPacket, &txPacket);
-            clock_t t_plan_end = clock();
-            double t_plan = (double)(t_plan_end - t_plan_begin) / CLOCKS_PER_SEC;
-            t_plan_avg += (t_plan - t_plan_avg)/(++plan_cycle);
-            // Check if tumbling
-            if (logGetInt(idTumble)){
-              // Stop motors
-              txPacket.state_info = (float) 0;
-              state = GROUND;
-              systemRequestShutdown();
-            }
-          }
-          appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
+        taskTxPacket.info = (float) 0;         // -> Task info 0: Running the task
+        // Running the task
+        clock_t t_plan_begin = clock();
+        planningTask(poseEst, &setpoint, &rxPacket, &taskTxPacket);
+        clock_t t_plan_end = clock();
+        double t_plan = (double)(t_plan_end - t_plan_begin) / CLOCKS_PER_SEC;
+        t_plan_avg += (t_plan - t_plan_avg)/(++plan_cycle);
+        //appchannelSendDataPacketBlock(&taskTxPacket, sizeof(taskTxPacket));
+        appchannelSendDataPacket(&taskTxPacket, sizeof(taskTxPacket));
+        // Check if tumbling
+        if (logGetInt(idTumble)){
+          // Stop motors
+          stateTxPacket.info = (float) 0;
+          state = GROUND;
+          systemRequestShutdown();
+          appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
+        }
+        // Check new command
+        if (received_command == HOVERING) {   // Stop and hover
+          state = HOVERING;
+          stateTxPacket.info = (float) 1;     // -> Send 1: Go to hovering
+          hoveringPose = poseEst;
+          appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
+          // To hovering position
+          setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
         }
         break;
 
       // If the drone is stopping -> continue descent until complete landing
       case STOPPING: 
-          // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
-          if (rxPacket.info == (float) 0) {                 // Info 0: Stop and land
-            if (reachedTargetHeight(poseEst.z,landing_height)) {
-              txPacket.state_info = (float) 0;              //   -> Send 0: Land
-              state = GROUND;
-              //Land
-              memset(&setpoint, 0, sizeof(setpoint_t));
-            } else {
-              txPacket.state_info = (float) 3;              //   -> Send 3: Lower the height before landing    
-              // Decrease height
-              setHoverSetpoint(&setpoint, 0, 0, landing_height, 0);
-            }
+        // Hover at landing height
+        setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, landing_height, hoveringPose.yaw);
+        // Check new commands
+        if (received_command == GROUND) {     // Stop and land
+          if (reachedTargetHeight(poseEst.z,landing_height)) {
+            state = GROUND;
+            stateTxPacket.info = (float) 0;   // -> Send 0: Land
+            //Land
+            hoveringPose = poseEst;
+            appchannelSendDataPacketBlock(&stateTxPacket, sizeof(stateTxPacket));
           }
-          appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
         }
         break;
     }
@@ -305,6 +303,24 @@ void appMain()
 
 
 // Functions definition
+
+State readIncomingPacket()
+{
+  State received_command;
+  // Read incoming packets
+  if (rxPacket.info == (float) 0) { 
+    received_command = GROUND;
+  }
+  if (rxPacket.info == (float) 1) { 
+    received_command = HOVERING;
+  }
+  if (rxPacket.info == (float) 2) { 
+    received_command = READY;
+  }
+  if (rxPacket.info == (float) 3) { 
+    received_command = STOPPING;
+  }
+}
 
 static void setHoverSetpoint(setpoint_t *setpoint, float vx, float vy, float z, float yawrate)
 {
@@ -345,6 +361,8 @@ bool reachedTargetHeight(const float est_height, const float target)
   else
     return false;
 }
+
+// Functions definition for reactive planning
 
 bool targetReached(const Pose pose, const Pose target)
 {
@@ -413,19 +431,19 @@ float velRepulsive(PacketRX *rxPacket){
 }
 
 
-void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket)
+void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, infoPacketTX *txPacket)
 {
   // Get target
   Pose target = target_points[curr_target];
   if (targetReached(pose, target)) {
-    clock_t t_target_reached = clock();
-    t_target = (double)(t_target_reached - t_target_begin) / CLOCKS_PER_SEC;
     target_counter = 0;
-    txPacket->task_info = (float) 1;
+    txPacket->info = (float) 1;   // -> Task info 1: Reached intermediate waypoint
     if (curr_target < N_WAYPOINTS-1)
       target = target_points[++curr_target];
     else
-      txPacket->task_info = (float) 2;
+      txPacket->info = (float) 2;   // -> Task info 2: Reached final waypoint
+      clock_t t_target_reached = clock();
+      t_target = (double)(t_target_reached - t_target_begin) / CLOCKS_PER_SEC;
   }
 
   /*
