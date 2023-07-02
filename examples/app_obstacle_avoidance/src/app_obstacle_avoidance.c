@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #include "app.h"
 #include "app_channel.h"
@@ -49,7 +50,7 @@
 #define IMG_W 320
 #define IMG_H 240
 #define MARGIN 5
-#define N_TARGETS 10
+#define N_WAYPOINTS 11
 
 // Custom data types
 
@@ -88,7 +89,7 @@ static float landing_height = 0.15f;
 // positive yaw -> turn left
 
 // SQUARE
-// Pose target_points[N_TARGETS] = { // x y z yaw
+// Pose target_points[N_WAYPOINTS] = { // x y z yaw
 //                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
 //                                  {0.5, 0.0, HOVERING_HEIGHT, 0},
 //                                  {0.5, 0.0, HOVERING_HEIGHT, 90},
@@ -102,22 +103,24 @@ static float landing_height = 0.15f;
 //                                 };
 
 // LEFT, RIGHT, FORTH, LEFT, RIGHT, BACK
-Pose target_points[N_TARGETS] = { // x y z yaw
+Pose target_points[N_WAYPOINTS] = { // x y z yaw
                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {0.0, 1.0, HOVERING_HEIGHT, 0},
-                                 {0.0, -1.0, HOVERING_HEIGHT, 0},
+                                 {0.0, 0.5, HOVERING_HEIGHT, 0},
+                                 {0.0, -0.5, HOVERING_HEIGHT, 0},
                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
                                  {0.5, 0.0, HOVERING_HEIGHT, 0},
                                  {1.0, 0.0, HOVERING_HEIGHT, 0},
                                  {2.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {2.0, 1.0, HOVERING_HEIGHT, 0},
-                                 {2.0, -1.0, HOVERING_HEIGHT, 0},
+                                 {2.0, 0.5, HOVERING_HEIGHT, 0},
+                                 {2.0, -0.5, HOVERING_HEIGHT, 0},
                                  {2.0, 0.0, HOVERING_HEIGHT, 0},
                                  {0.0, 0.0, HOVERING_HEIGHT, 0}
                                 };
 
 int curr_target = 0;
 int target_counter = 0;
+clock_t t_target_begin;
+double t_target;
 
 
 // Functions declaration
@@ -126,8 +129,8 @@ static void setPositionSetpoint(setpoint_t *setpoint, float x, float y, float z,
 bool reachedTargetHeight(const float est_height, const float target);
 bool targetReached(const Pose pose, const Pose target);
 float collisionProbability(PacketRX *rxPacket);
-float velRepulsive(PacketRX *rxPacket, float collision_prob);
-void explorationTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket);
+float velRepulsive(PacketRX *rxPacket);
+void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket);
 
 
 // Main
@@ -135,6 +138,7 @@ void appMain()
 {
   DEBUG_PRINT("Waiting for activation ...\n");
 
+  // Initialize packets for communication
   PacketRX rxPacket;
   PacketTX txPacket;
 
@@ -146,6 +150,7 @@ void appMain()
   logVarId_t idZEstimate = logGetVarId("stateEstimate", "z");
   logVarId_t idYawEstimate = logGetVarId("stateEstimate", "yaw");
 
+  // Initialize Pose structs
   Pose poseEst;
   Pose hoveringPose = {0.0,0.0,HOVERING_HEIGHT,0.0};
 
@@ -157,6 +162,11 @@ void appMain()
 
   // Getting Param IDs of the deck driver initialization
   //paramVarId_t idPositioningDeck = paramGetVarId("deck", "bcFlow2");
+
+  // Other variables
+  int plan_cycle = 0;
+  double t_plan_avg = 0.0;
+
 
   vTaskDelay(M2T(3000));
 
@@ -191,7 +201,7 @@ void appMain()
             state = HOVERING;
             // Lift off
             // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
         }
@@ -214,7 +224,7 @@ void appMain()
             txPacket.state_info = (float) 1;              //   -> Send 1: Hovering
             // To hovering position
             // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
           }
           else if (rxPacket.info == (float) 2) {            // Info 2: Start the task
             if (!reachedTargetHeight(poseEst.z, HOVERING_HEIGHT)) {
@@ -222,9 +232,11 @@ void appMain()
             } else {
               txPacket.state_info = (float) 2;              //   -> Send 2: Drone ready
               state = READY;
+              plan_cycle = 0;
+              t_target_begin = clock();
             // Still hover, start moving when in state ready
             // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
             }
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
@@ -238,17 +250,20 @@ void appMain()
           if (rxPacket.info == (float) 1) {               // Info 1: Stop and hover
             txPacket.state_info = (float) 1;              //   -> Send 1: Go to hovering
             state = HOVERING;
-            // Hovering at default height
+            // Hovering at default height in the current position
             // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
-            hoveringPose = poseEst
-            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw)
+            hoveringPose = poseEst;
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
           }
           else if (rxPacket.info == (float) 2) {          // Info 2: Start/continue the task
             txPacket.state_info = (float) 2;              //   -> Send 2: Running the task
             txPacket.task_info = (float) 0;               //   -> Task info 0: Running the task
             // Running the task
-            explorationTask(poseEst, &setpoint, &rxPacket, &txPacket);
-            //setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
+            clock_t t_plan_begin = clock();
+            planningTask(poseEst, &setpoint, &rxPacket, &txPacket);
+            clock_t t_plan_end = clock();
+            double t_plan = (double)(t_plan_end - t_plan_begin) / CLOCKS_PER_SEC;
+            t_plan_avg += (t_plan - t_plan_avg)/(++plan_cycle);
             // Check if tumbling
             if (logGetInt(idTumble)){
               // Stop motors
@@ -282,7 +297,7 @@ void appMain()
         break;
     }
 
-    vTaskDelay(M2T(9));
+    vTaskDelay(M2T(19));
     commanderSetSetpoint(&setpoint, 3);
 
   }
@@ -344,7 +359,7 @@ bool targetReached(const Pose pose, const Pose target)
 
 float collisionProbability(PacketRX *rxPacket)
 {
-  // Add safety margin of 5px // TODO: also in y?
+  // Add safety margin along width dimension
   if (rxPacket->xmax + MARGIN <= IMG_W){
     rxPacket->xmax += MARGIN;
   } else {
@@ -358,26 +373,31 @@ float collisionProbability(PacketRX *rxPacket)
   
   // Get the area of the detected object
   int width = rxPacket->xmax - rxPacket->xmin;
-  int height = rxPacket->ymax - rxPacket->ymin;
-  int area = width*height;
+  // int height = rxPacket->ymax - rxPacket->ymin;
+  // int area = width*height;
 
   // Check if obstacle is on the way, if true update the collision probability
   float collision_prob = 0.0;
   if (rxPacket->xmin <= IMG_W/2 && rxPacket->xmax >= IMG_W/2) {
-    collision_prob = area/(IMG_W*IMG_H); //TODO: something related to area and object -> need to consider distance even if we don't have that info
+    // collision_prob = area/(IMG_W*IMG_H); //TODO: something related to area and object -> need to consider distance even if we don't have that info
+    collision_prob = width/(IMG_W*80/100);
+    if (collision_prob >= 1) {
+      collision_prob = 1;
+    } 
   }
-
   return collision_prob;
 }
 
-float velRepulsive(PacketRX *rxPacket, float collision_prob){
+float velRepulsive(PacketRX *rxPacket){
   
   // Direction of the lateral repulsive velocity
+  // Move in the direction opposite of the side which is occupied the most
   int dir = 1;
-  if ( (IMG_W - rxPacket->xmin - rxPacket->xmax) >=0 ){   // move in the direction opposite of the side which is occupied the most
-    dir = -1;
+  // If left part of detected obstacle is bigger than right part
+  if ( (IMG_W - rxPacket->xmin - rxPacket->xmax) >=0 ){   
+    dir = -1;  // turn right
   } else {
-    dir = 1;
+    dir = 1;   // turn left
   }
 
   // Get the module of the lateral repulsive velocity based on the area that the object covers in the image plane
@@ -393,44 +413,73 @@ float velRepulsive(PacketRX *rxPacket, float collision_prob){
 }
 
 
-void explorationTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket)
+void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket)
 {
   // Get target
   Pose target = target_points[curr_target];
   if (targetReached(pose, target)) {
+    clock_t t_target_reached = clock();
+    t_target = (double)(t_target_reached - t_target_begin) / CLOCKS_PER_SEC;
     target_counter = 0;
     txPacket->task_info = (float) 1;
-    if (curr_target < N_TARGETS-1)
+    if (curr_target < N_WAYPOINTS-1)
       target = target_points[++curr_target];
     else
       txPacket->task_info = (float) 2;
   }
 
+  /*
   // Compute collision probability
-  //float collision_prob = 0.0;
-  //if (rxPacket->obj_id != (float) 0) {
-  //  collision_prob = collisionProbability(rxPacket);
-  //}
-  
-  // Compute a repulsive lateral velocity to avoid the obstacle
-  //float y_vel_repulsive = 0.0;
-  //if (collision_prob > 0){
-  //  y_vel_repulsive = velRepulsive(rxPacket, collision_prob);
-  //}
+  float safety_factor = 1.0;
+  float vel_y_repulsive = 0.0;
+  if (rxPacket->obj_id != (float) 0) {
+    float collision_prob = collisionProbability(rxPacket);
+    safety_factor = pow(collision_prob-1, 2);
+
+    // Compute a repulsive lateral velocity to avoid the obstacle
+    if (collision_prob > 0){
+      vel_y_repulsive = velRepulsive(rxPacket);
+    }
+  }
 
   // DEBUG_PRINT("%.1f\n", (double) y_vel_repulsive);
 
   // Compute desired velocity
-  //float max_vel = 1.0;
+  float max_vel = 1.0;  // [m/s]
+  float max_yaw_rate = 30.0;   // [deg/s]
+  float dt = 0.1;  // [s]  time between consecutive commands
   //float vel_x = max_vel * pow(collision_prob - 1, 4) * (pow(pose.x - target.x, 2) / pow(target_points[curr_target-1].x - target.x, 2));
   //float vel_y = y_vel_repulsive + max_vel * (pow(pose.y - target.y, 2) / pow(target_points[curr_target-1].y - target.y, 2));
   //float vel_z = 0.0;
   //float vel_yaw = 0.0;
 
+  // Compute desired velocities
+  float dist_x = target.x - pose.x;
+  float dist_y = target.y - pose.y;
+
+  float rel_dist_x =  cos(pose.yaw/180*M_PI)*dist_x + sin(pose.yaw/180*M_PI)*dist_y; 
+  float rel_dist_y = -sin(pose.yaw/180*M_PI)*dist_x + cos(pose.yaw/180*M_PI)*dist_y;
+  float rel_yaw = atan2(rel_dist_y,rel_dist_x) * 180/M_PI;
+  
+  float vel_x = min(max_vel, sqrt(pow(dist_x, 2) + pow(dist_y, 2))) * safety_factor;
+
+  float rep_yaw = atan2(vel_y_repulsive,vel_x) * 180/M_PI;
+
+  float des_yaw_rate = (rel_yaw*safety_factor + rep_yaw)/dt;
+
+  // apparently yaw rate command is opposite direction to the direction of change of the yaw
+  float yaw_rate = 0.0;
+  if (des_yaw_rate >= 0) {
+    yaw_rate = max(-max_yaw_rate, -des_yaw_rate);
+  } else {
+    yaw_rate = min(max_yaw_rate, -des_yaw_rate);
+  }
+  */
+
   // Compute setpoint
   setPositionSetpoint(setpoint, target.x ,target.y, target.z, target.yaw);
   //TODO: switch to a velocity control for reactive collision avoidance
-  //setHoverSetpoint(setpoint, vel_x, vel_y, HOVERING_HEIGHT, vel_yaw);
+  //setHoverSetpoint(setpoint, vel_x, 0.0, HOVERING_HEIGHT, yaw_rate);
 
 }
 
