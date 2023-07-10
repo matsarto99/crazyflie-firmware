@@ -1,28 +1,15 @@
 /**
- * ,---------,       ____  _ __
- * |  ,-^-,  |      / __ )(_) /_______________ _____  ___
- * | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
- * | / ,--´  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
- *    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
+ * Author: Mattia Sartori
+ * E-mail: matsarto99@gmail.com
  *
- * Crazyflie control firmware
- *
- * Copyright (C) 2019 Bitcraze AB
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, in version 3.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- *
- *
- * something about the code
+ * Developed in the context of the author's Master's Thesis project
+ * 
+ * Code for reactive planning for obstacle avoidance on the Bitcraze Crazyflie 2.1 drone.
+ * - The code should run in parallel with the wifi image streamer on the AIdeck.
+ * - The images are streames to an external pc which is connected to the drone via radio link.
+ * - The pc runs an object detection task and send the bounding boxes to the drone.
+ * - The drone plans its commands to reach a desired set of waypoints
+ * - If an obstacle is detected, the drone plans a reactive command in order to avoid it and reach the waypoint safely
  */
 
 #include <stdlib.h>
@@ -44,13 +31,21 @@
 #include "log.h"
 #include "param.h"
 
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#define max(a,b) (((a) > (b)) ? (a) : (b))
+
 #define DEBUG_MODULE "OBSTACLE_AVOIDANCE"
-#define HOVERING_HEIGHT 0.4f
-#define THRESH 0.1f
-#define IMG_W 320
-#define IMG_H 240
-#define MARGIN 5
-#define N_WAYPOINTS 11
+#define HOVERING_HEIGHT 0.4f        // Default hovering height
+#define LANDING_HEIGHT 0.1f         // Landing height to be reached before stopping the motors
+#define TARGET_THRESHOLD 0.15f      // Minimum distance to target for which the waypoint is considered to be reached
+#define TARGET_COUNTER 5            // Number of consecutive iterations in which the drone has to be inside the target threshold
+                                    //    before switching to the next target
+#define IMG_W 320                   // Image width
+#define IMG_H 240                   // Image height
+#define MARGIN 20                   // Safety margin in pixel added to the bounding box of the detcted obstacle
+#define N_WAYPOINTS 2               // Number of waypoints to traverse
+
+float PI = 3.14159265358979323846;
 
 // Custom data types
 
@@ -65,7 +60,7 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
   char state_info;
-  char task_info;
+  float task_info;
 } PacketTX;
 
 typedef enum {
@@ -85,51 +80,106 @@ typedef struct {
 
 // Global variables
 static State state = GROUND;
-static float landing_height = 0.15f;
+int curr_target = 0;
+int target_counter = 0;
+long t_target_begin;
+long t_target;
+float safety_factor = 1.0;
+float vel_y_repulsive = 0.0;
+
+// Sequence of targets
 // positive yaw -> turn left
 
 // SQUARE
 // Pose target_points[N_WAYPOINTS] = { // x y z yaw
-//                                  {0.0, 0.0, HOVERING_HEIGHT, 0},
-//                                  {0.5, 0.0, HOVERING_HEIGHT, 0},
-//                                  {0.5, 0.0, HOVERING_HEIGHT, 90},
-//                                  {0.5, 0.5, HOVERING_HEIGHT, 90},
-//                                  {0.5, 0.5, HOVERING_HEIGHT, 180},
-//                                  {0.0, 0.5, HOVERING_HEIGHT, 180},
-//                                  {0.0, 0.5, HOVERING_HEIGHT, 270},
-//                                  {0.0, 0.0, HOVERING_HEIGHT, 270},
-//                                  {0.0, 0.0, HOVERING_HEIGHT, 360},
-//                                  {0.0, 0.0, HOVERING_HEIGHT, 0} 
-//                                 };
+//                                    {0.0, 0.0, HOVERING_HEIGHT, 0},
+//                                    {0.5, 0.0, HOVERING_HEIGHT, 0},
+//                                    {0.5, 0.0, HOVERING_HEIGHT, 90},
+//                                    {0.5, 0.5, HOVERING_HEIGHT, 90},
+//                                    {0.5, 0.5, HOVERING_HEIGHT, 180},
+//                                    {0.0, 0.5, HOVERING_HEIGHT, 180},
+//                                    {0.0, 0.5, HOVERING_HEIGHT, 270},
+//                                    {0.0, 0.0, HOVERING_HEIGHT, 270},
+//                                    {0.0, 0.0, HOVERING_HEIGHT, 360},
+//                                    {0.0, 0.0, HOVERING_HEIGHT, 0} 
+//                                   };
 
 // LEFT, RIGHT, FORTH, LEFT, RIGHT, BACK
-Pose target_points[N_WAYPOINTS] = { // x y z yaw
-                                 {0.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {0.0, 0.5, HOVERING_HEIGHT, 0},
-                                 {0.0, -0.5, HOVERING_HEIGHT, 0},
-                                 {0.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {0.5, 0.0, HOVERING_HEIGHT, 0},
-                                 {1.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {2.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {2.0, 0.5, HOVERING_HEIGHT, 0},
-                                 {2.0, -0.5, HOVERING_HEIGHT, 0},
-                                 {2.0, 0.0, HOVERING_HEIGHT, 0},
-                                 {0.0, 0.0, HOVERING_HEIGHT, 0}
-                                };
+//Pose target_points[N_WAYPOINTS] = { // x y z yaw
+//                                   {0.0, 0.0, HOVERING_HEIGHT, 0},
+//                                   {0.0, 0.5, HOVERING_HEIGHT, 0},
+//                                   {0.0, -0.5, HOVERING_HEIGHT, 0},
+//                                   {0.0, 0.0, HOVERING_HEIGHT, 0},
+//                                   {0.5, 0.0, HOVERING_HEIGHT, 0},
+//                                   {1.0, 0.0, HOVERING_HEIGHT, 0},
+//                                   {1.0, 0.5, HOVERING_HEIGHT, 0},
+//                                   {1.0, -0.5, HOVERING_HEIGHT, 0},
+//                                   {1.0, 0.0, HOVERING_HEIGHT, 0},
+//                                   {0.0, 0.0, HOVERING_HEIGHT, 0}
+//                                  };
 
-int curr_target = 0;
-int target_counter = 0;
-clock_t t_target_begin;
-double t_target;
+// Straight path, supposed to be with an obstacle on the way
+Pose target_points[N_WAYPOINTS] = { // x y z yaw
+                                   {0.0, 0.0, HOVERING_HEIGHT, 0},
+                                   {3.5, 0.0, HOVERING_HEIGHT, 0}
+                                  };
 
 
 // Functions declaration
+
+/**
+ * \brief Set a command in terms of desired velocities in body frame and desired absolute height
+ * \param setpoint Pointer to the setpoint for setting commands
+ * \param vx Desired velocity along x
+ * \param vy Desired velocity along y
+ * \param z Desired height
+ * \param yawrate Desired yaw rate
+ */
 static void setHoverSetpoint(setpoint_t *setpoint, float vx, float vy, float z, float yawrate);
+
+/**
+ * \brief Set a command in terms of absolute position and attitude
+ * \param setpoint Pointer to the setpoint for setting commands
+ * \param x Desired position x
+ * \param y Desired position y
+ * \param z Desired height
+ * \param yaw Desired yaw
+ */
 static void setPositionSetpoint(setpoint_t *setpoint, float x, float y, float z, float yaw);
-bool reachedTargetHeight(const float est_height, const float target);
+
+/**
+ * \brief Check if the drone reached the desired height
+ * \param est_height Height estimated by the drone
+ * \param des_height Desired height to reach
+ */
+bool reachedTargetHeight(const float est_height, const float des_height);
+
+/**
+ * \brief Check if the drone reached the desired target
+ * \param pose Estimated pose
+ * \param target Desired target
+ */
 bool targetReached(const Pose pose, const Pose target);
-float collisionProbability(PacketRX *rxPacket);
+
+/**
+ * \brief Compute the collision risk based on the boundung box parameters of the detected obstacle
+ * \param rxPacket Pointer to the received packet containing the bbox
+ */
+float collisionRisk(PacketRX *rxPacket);
+
+/**
+ * \brief Compute the repulsive action when an obstacle is on the way
+ * \param rxPacket Pointer to the received packet containing the bbox
+ */
 float velRepulsive(PacketRX *rxPacket);
+
+/**
+ * \brief Run the reactive planner, compute commands to avoid the obstacle
+ * \param pose Estimated pose
+ * \param setpoint Pointer to the setpoint for setting commands
+ * \param rxPacket Pointer to the received packet containing the bbox
+ * \param txPacket Pointer to the packet to transmit
+ */
 void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket);
 
 
@@ -142,6 +192,7 @@ void appMain()
   PacketRX rxPacket;
   PacketTX txPacket;
 
+  // Setpoint to define desired commands
   static setpoint_t setpoint;
 
   // Getting the Logging IDs of the state estimates
@@ -160,16 +211,13 @@ void appMain()
   // Getting the Logging ID to see if the radio is still connected
   logVarId_t idConnected = logGetVarId("radio", "isConnected");
 
-  // Getting Param IDs of the deck driver initialization
-  //paramVarId_t idPositioningDeck = paramGetVarId("deck", "bcFlow2");
-
   // Other variables
   int plan_cycle = 0;
   double t_plan_avg = 0.0;
 
-
   vTaskDelay(M2T(3000));
 
+  // State machine
   while(1) {
     
     // Get Pose
@@ -190,11 +238,13 @@ void appMain()
       // If the drone is on the ground and receives start signal from the pc -> liftoff
       case GROUND: 
         // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
+        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 10)) {
           if (rxPacket.info == (float) 0) {               // Info 0: Do nothing
             txPacket.state_info = (float) 0;              //   -> Send 0: On the ground
             // Stay on the ground
             memset(&setpoint, 0, sizeof(setpoint_t));
+            // setPositionSetpoint(&setpoint, poseEst.x, poseEst.y, 0, 0);
+            // setHoverSetpoint(&setpoint, 0, 0, 0, 0);
           }
           else if (rxPacket.info == (float) 1) {          // Info 1: Start drone
             txPacket.state_info = (float) 1;              //   -> Send 1: Going toward hovering
@@ -204,6 +254,7 @@ void appMain()
             setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
+          //commanderSetSetpoint(&setpoint, 3);
         }
         else {
           txPacket.state_info = (float) 0;    // If nothing is received -> Info 0: Do nothing
@@ -213,12 +264,14 @@ void appMain()
       // If the drone is hovering and receives start signal -> ready to start the task
       case HOVERING: 
         // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
+        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 10)) {
           if (rxPacket.info == (float) 0) {               // Info 0: Stop the drone
             txPacket.state_info = (float) 3;              //   -> Send 3: Start landing
             state = STOPPING;
             // Land
-            memset(&setpoint, 0, sizeof(setpoint_t));
+            // memset(&setpoint, 0, sizeof(setpoint_t));
+            hoveringPose = poseEst;
+            setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, LANDING_HEIGHT, hoveringPose.yaw);
           }
           else if (rxPacket.info == (float) 1) {          // Info 1: Hover
             txPacket.state_info = (float) 1;              //   -> Send 1: Hovering
@@ -231,22 +284,24 @@ void appMain()
               txPacket.state_info = (float) 1;              //   -> Send 1: To hovering position
             } else {
               txPacket.state_info = (float) 2;              //   -> Send 2: Drone ready
+              txPacket.task_info = (float) 0;               //   -> Task info 0: Running the task
               state = READY;
               plan_cycle = 0;
-              t_target_begin = clock();
+              t_target_begin = xTaskGetTickCount();
             // Still hover, start moving when in state ready
             // setHoverSetpoint(&setpoint, 0, 0, HOVERING_HEIGHT, 0);
             setPositionSetpoint(&setpoint, hoveringPose.x, hoveringPose.y, hoveringPose.z, hoveringPose.yaw);
             }
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
+          //commanderSetSetpoint(&setpoint, 3);
         }
         break;
 
       // If the drone is ready, go on with the task or see if stopping is needed
       case READY: 
         // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
+        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 10)) {
           if (rxPacket.info == (float) 1) {               // Info 1: Stop and hover
             txPacket.state_info = (float) 1;              //   -> Send 1: Go to hovering
             state = HOVERING;
@@ -258,12 +313,15 @@ void appMain()
           else if (rxPacket.info == (float) 2) {          // Info 2: Start/continue the task
             txPacket.state_info = (float) 2;              //   -> Send 2: Running the task
             txPacket.task_info = (float) 0;               //   -> Task info 0: Running the task
+            long t_plan_begin = xTaskGetTickCount();
+            
             // Running the task
-            clock_t t_plan_begin = clock();
             planningTask(poseEst, &setpoint, &rxPacket, &txPacket);
-            clock_t t_plan_end = clock();
-            double t_plan = (double)(t_plan_end - t_plan_begin) / CLOCKS_PER_SEC;
+            
+            long t_plan_end = xTaskGetTickCount();
+            double t_plan = (double)(t_plan_end - t_plan_begin);
             t_plan_avg += (t_plan - t_plan_avg)/(++plan_cycle);
+
             // Check if tumbling
             if (logGetInt(idTumble)){
               // Stop motors
@@ -273,32 +331,36 @@ void appMain()
             }
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
+          //commanderSetSetpoint(&setpoint, 3);
         }
         break;
 
       // If the drone is stopping -> continue descent until complete landing
       case STOPPING: 
           // Read incoming packets
-        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 1)) {
+        if (appchannelReceiveDataPacket(&rxPacket, sizeof(rxPacket), 10)) {
           if (rxPacket.info == (float) 0) {                 // Info 0: Stop and land
-            if (reachedTargetHeight(poseEst.z,landing_height)) {
+            if (reachedTargetHeight(poseEst.z,LANDING_HEIGHT)) {
               txPacket.state_info = (float) 0;              //   -> Send 0: Land
               state = GROUND;
               //Land
               memset(&setpoint, 0, sizeof(setpoint_t));
+              // setPositionSetpoint(&setpoint, poseEst.x, poseEst.y, 0, 0);
+              // setHoverSetpoint(&setpoint, 0, 0, 0, 0);
             } else {
               txPacket.state_info = (float) 3;              //   -> Send 3: Lower the height before landing    
               // Decrease height
-              setHoverSetpoint(&setpoint, 0, 0, landing_height, 0);
+              setHoverSetpoint(&setpoint, 0, 0, LANDING_HEIGHT, 0);
             }
           }
           appchannelSendDataPacketBlock(&txPacket, sizeof(txPacket));
+          //commanderSetSetpoint(&setpoint, 3);
         }
         break;
     }
 
-    vTaskDelay(M2T(19));
     commanderSetSetpoint(&setpoint, 3);
+    vTaskDelay(M2T(50));
 
   }
 }
@@ -309,17 +371,17 @@ void appMain()
 static void setHoverSetpoint(setpoint_t *setpoint, float vx, float vy, float z, float yawrate)
 {
   setpoint->mode.z = modeAbs;
-  setpoint->position.z = z;
+  setpoint->position.z = z;   // m
 
   setpoint->mode.yaw = modeVelocity;
-  setpoint->attitudeRate.yaw = yawrate;
+  setpoint->attitudeRate.yaw = yawrate;   // deg/s
 
   setpoint->mode.x = modeVelocity;
   setpoint->mode.y = modeVelocity;
-  setpoint->velocity.x = vx;
-  setpoint->velocity.y = vy;
+  setpoint->velocity.x = vx;    // m/s
+  setpoint->velocity.y = vy;    // m/s
 
-  setpoint->velocity_body = true;
+  setpoint->velocity_body = true;   // true if velocity is given in body frame; false if velocity is given in world frame
 }
 
 static void setPositionSetpoint(setpoint_t *setpoint, float x, float y, float z, float yaw)
@@ -328,19 +390,19 @@ static void setPositionSetpoint(setpoint_t *setpoint, float x, float y, float z,
   setpoint->mode.y = modeAbs;
   setpoint->mode.z = modeAbs;
   
-  setpoint->position.x = x;
-  setpoint->position.y = y;
-  setpoint->position.z = z;
+  setpoint->position.x = x;   // m
+  setpoint->position.y = y;   // m
+  setpoint->position.z = z;   // m
 
   setpoint->mode.yaw = modeAbs;
-  setpoint->attitude.yaw = yaw;
+  setpoint->attitude.yaw = yaw;   // deg
 
-  setpoint->velocity_body = true;
+  setpoint->velocity_body = true;   // true if velocity is given in body frame; false if velocity is given in world frame
 }
 
-bool reachedTargetHeight(const float est_height, const float target)
+bool reachedTargetHeight(const float est_height, const float des_height)
 {
-  if ( (float)fabs(est_height - target) <= THRESH)
+  if ( (float)fabs(est_height - des_height) <= TARGET_THRESHOLD)
     return true;
   else
     return false;
@@ -348,16 +410,12 @@ bool reachedTargetHeight(const float est_height, const float target)
 
 bool targetReached(const Pose pose, const Pose target)
 {
-  if ( (float)sqrt( pow(pose.x - target.x, 2) +
-                    pow(pose.y - target.y, 2) +
-                    pow(pose.z - target.z, 2) ) <= THRESH
-        && ++target_counter >= 10)
-    return true;
-  else
-    return false;
+  return ( (float)sqrt( pow(pose.x - target.x, 2) +
+                        pow(pose.y - target.y, 2) +
+                        pow(pose.z - target.z, 2) ) <= TARGET_THRESHOLD);
 }
 
-float collisionProbability(PacketRX *rxPacket)
+float collisionRisk(PacketRX *rxPacket)
 {
   // Add safety margin along width dimension
   if (rxPacket->xmax + MARGIN <= IMG_W){
@@ -376,16 +434,17 @@ float collisionProbability(PacketRX *rxPacket)
   // int height = rxPacket->ymax - rxPacket->ymin;
   // int area = width*height;
 
-  // Check if obstacle is on the way, if true update the collision probability
-  float collision_prob = 0.0;
+  // Check if obstacle is on the way, if true, update the collision risk
+  float collision_risk = 0.0;
   if (rxPacket->xmin <= IMG_W/2 && rxPacket->xmax >= IMG_W/2) {
-    // collision_prob = area/(IMG_W*IMG_H); //TODO: something related to area and object -> need to consider distance even if we don't have that info
-    collision_prob = width/(IMG_W*80/100);
-    if (collision_prob >= 1) {
-      collision_prob = 1;
-    } 
+    //Collision risk related to area and object -> need to consider distance even if we don't have that info
+    // collision_risk = area/(IMG_W*IMG_H); 
+    collision_risk = (float) width/(IMG_W*80/100);
+    if (collision_risk >= 1) {
+      collision_risk = 1;
+    }
   }
-  return collision_prob;
+  return collision_risk;
 }
 
 float velRepulsive(PacketRX *rxPacket){
@@ -393,7 +452,7 @@ float velRepulsive(PacketRX *rxPacket){
   // Direction of the lateral repulsive velocity
   // Move in the direction opposite of the side which is occupied the most
   int dir = 1;
-  // If left part of detected obstacle is bigger than right part
+  // If the object is mainly in the left side of the image plane ? turn right : turn left
   if ( (IMG_W - rxPacket->xmin - rxPacket->xmax) >=0 ){   
     dir = -1;  // turn right
   } else {
@@ -402,7 +461,7 @@ float velRepulsive(PacketRX *rxPacket){
 
   // Get the module of the lateral repulsive velocity based on the area that the object covers in the image plane
   float vel = 0.0;
-  float k_vel = 1.0;
+  float k_vel = 0.6;
   if (dir < 0){
     vel = k_vel * (IMG_W/2 - rxPacket->xmin)/(IMG_W/2);
   } else {
@@ -412,100 +471,109 @@ float velRepulsive(PacketRX *rxPacket){
   return dir * vel;
 }
 
-
 void planningTask(const Pose pose, setpoint_t *setpoint, PacketRX *rxPacket, PacketTX *txPacket)
 {
+  float max_vel = 1.0;  // [m/s]
+  float max_yaw_rate = 60.0;   // [deg/s]
+  float dt = 0.1;  // [s]  time between consecutive commands
+  float alpha = 0.5;
+  float beta = 0.5;
+  
   // Get target
   Pose target = target_points[curr_target];
+  
+  // If target is reached, move to the next one
+  // If close to target, send command to stay over the target for some consecutive iterations
   if (targetReached(pose, target)) {
-    clock_t t_target_reached = clock();
-    t_target = (double)(t_target_reached - t_target_begin) / CLOCKS_PER_SEC;
-    target_counter = 0;
-    txPacket->task_info = (float) 1;
-    if (curr_target < N_WAYPOINTS-1)
-      target = target_points[++curr_target];
-    else
-      txPacket->task_info = (float) 2;
+    float dist_x = target.x - pose.x;
+    float dist_y = target.y - pose.y;
+
+    float rel_dist_x =  cosf(pose.yaw/180*PI)*dist_x + sinf(pose.yaw/180*PI)*dist_y; 
+    float rel_dist_y = -sinf(pose.yaw/180*PI)*dist_x + cosf(pose.yaw/180*PI)*dist_y;
+
+    float dist_yaw = target.yaw-pose.yaw;
+    float yr = 0.0;
+    if (dist_yaw >= 0) {
+      yr = min(max_yaw_rate, dist_yaw/dt);
+    } else {
+      yr = max(-max_yaw_rate, dist_yaw/dt);
+    }
+
+    // If the drone is in reach of the target, command a movement over the target
+    setHoverSetpoint(setpoint, rel_dist_x, rel_dist_y, target.z, yr);
+
+    // Stay on the target for some consecutive iterations
+    if (++target_counter >= TARGET_COUNTER){
+      // Target has been "reliably" reached
+      long t_target_reached = xTaskGetTickCount();
+      t_target = (double)(t_target_reached - t_target_begin);
+      target_counter = 0;
+      txPacket->task_info = (float) 1;  // Reached intermediate waypoint
+      if (curr_target < N_WAYPOINTS-1) {
+        // Update target waypoint
+        target = target_points[++curr_target];
+      } else {
+        txPacket->task_info = (float) 2;  // Reached final waypoint
+        state = HOVERING;
+      }
+    }
+    return;
   }
 
-  /*
-  // Compute collision probability
-  float safety_factor = 1.0;
-  float vel_y_repulsive = 0.0;
+  // Compute collision risk and repulsive action
+  float new_factor = 1.0;
+  float new_vel_y_repulsive = 0.0;
   if (rxPacket->obj_id != (float) 0) {
-    float collision_prob = collisionProbability(rxPacket);
-    safety_factor = pow(collision_prob-1, 2);
+    float collision_risk = collisionRisk(rxPacket);
+    new_factor = powf(collision_risk-1, 2);
 
     // Compute a repulsive lateral velocity to avoid the obstacle
-    if (collision_prob > 0){
-      vel_y_repulsive = velRepulsive(rxPacket);
+    if (collision_risk > 0){
+      new_vel_y_repulsive = velRepulsive(rxPacket);
+      // DEBUG_PRINT("%.1f\n", (double) y_vel_repulsive);
     }
   }
 
-  // DEBUG_PRINT("%.1f\n", (double) y_vel_repulsive);
+  // Introduce memory in the repulsive action and in the safety factor
+  vel_y_repulsive = vel_y_repulsive * (1-beta) + new_vel_y_repulsive * beta;
+  safety_factor = safety_factor * (1-alpha) + new_factor * alpha;
 
-  // Compute desired velocity
-  float max_vel = 1.0;  // [m/s]
-  float max_yaw_rate = 30.0;   // [deg/s]
-  float dt = 0.1;  // [s]  time between consecutive commands
-  //float vel_x = max_vel * pow(collision_prob - 1, 4) * (pow(pose.x - target.x, 2) / pow(target_points[curr_target-1].x - target.x, 2));
-  //float vel_y = y_vel_repulsive + max_vel * (pow(pose.y - target.y, 2) / pow(target_points[curr_target-1].y - target.y, 2));
-  //float vel_z = 0.0;
-  //float vel_yaw = 0.0;
-
-  // Compute desired velocities
+  // Distance in global reference frame
   float dist_x = target.x - pose.x;
   float dist_y = target.y - pose.y;
 
-  float rel_dist_x =  cos(pose.yaw/180*M_PI)*dist_x + sin(pose.yaw/180*M_PI)*dist_y; 
-  float rel_dist_y = -sin(pose.yaw/180*M_PI)*dist_x + cos(pose.yaw/180*M_PI)*dist_y;
-  float rel_yaw = atan2(rel_dist_y,rel_dist_x) * 180/M_PI;
+  // Distances and angle offset in relative reference frame
+  float rel_dist_x =  cosf(pose.yaw/180*PI)*dist_x + sinf(pose.yaw/180*PI)*dist_y; 
+  float rel_dist_y = -sinf(pose.yaw/180*PI)*dist_x + cosf(pose.yaw/180*PI)*dist_y;
+  float rel_yaw = atan2f(rel_dist_y,rel_dist_x) * 180/PI;
   
-  float vel_x = min(max_vel, sqrt(pow(dist_x, 2) + pow(dist_y, 2))) * safety_factor;
-
-  float rep_yaw = atan2(vel_y_repulsive,vel_x) * 180/M_PI;
-
-  float des_yaw_rate = (rel_yaw*safety_factor + rep_yaw)/dt;
-
-  // apparently yaw rate command is opposite direction to the direction of change of the yaw
+  // Compute desired velocities
+  // *** Considering obstacle ***
+  float vel_x = min(max_vel, sqrtf(powf(dist_x, 2) + powf(dist_y, 2))) * safety_factor * fabsf(rel_yaw/180 - 1);
+  float rep_yaw = atan2f(vel_y_repulsive,vel_x) * 180/PI;
+  float des_yaw_rate = (rel_yaw*fabsf(rel_yaw/180 - 1)*((float) 0.8) + rep_yaw)*safety_factor/dt;
+  
+  // Yaw rate command commanded from the drone is in the same direction to the direction of change of the yaw
+  // It is not true when commands are sent from the pc
   float yaw_rate = 0.0;
   if (des_yaw_rate >= 0) {
-    yaw_rate = max(-max_yaw_rate, -des_yaw_rate);
+    yaw_rate = min(max_yaw_rate, des_yaw_rate);
   } else {
-    yaw_rate = min(max_yaw_rate, -des_yaw_rate);
+    yaw_rate = max(-max_yaw_rate, des_yaw_rate);
   }
-  */
+
+  // Compute desired velocities
+  // *** Without considering obstacle ***
+  // float vel_x = min(max_vel, sqrtf(powf(dist_x, 2) + powf(dist_y, 2))) * fabsf(rel_yaw/180 - 1);
+  // float yaw_rate = 0.0;
+  // if (rel_yaw >= 0) {
+  //   yaw_rate = min(max_yaw_rate, rel_yaw/dt);
+  // } else {
+  //   yaw_rate = max(-max_yaw_rate, rel_yaw/dt);
+  // }
 
   // Compute setpoint
-  setPositionSetpoint(setpoint, target.x ,target.y, target.z, target.yaw);
-  //TODO: switch to a velocity control for reactive collision avoidance
-  //setHoverSetpoint(setpoint, vel_x, 0.0, HOVERING_HEIGHT, yaw_rate);
+  setHoverSetpoint(setpoint, vel_x, 0.0, HOVERING_HEIGHT, yaw_rate);
 
 }
 
-
-
-/*
-typedef struct setpoint_s {
-  uint32_t timestamp;
-
-  attitude_t attitude;      // deg
-  attitude_t attitudeRate;  // deg/s
-  quaternion_t attitudeQuaternion;
-  float thrust;
-  point_t position;         // m
-  velocity_t velocity;      // m/s
-  acc_t acceleration;       // m/s^2
-  bool velocity_body;       // true if velocity is given in body frame; false if velocity is given in world frame
-
-  struct {
-    stab_mode_t x;
-    stab_mode_t y;
-    stab_mode_t z;
-    stab_mode_t roll;
-    stab_mode_t pitch;
-    stab_mode_t yaw;
-    stab_mode_t quat;
-  } mode;
-} setpoint_t;
-*/
